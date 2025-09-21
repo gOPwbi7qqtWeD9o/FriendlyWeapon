@@ -1,170 +1,174 @@
 # This script uses Playwright to concurrently open web pages from a file
-# and click two specific buttons on each page. It's designed for speed
-# and includes a secure method for handling logins.
+# and click two specific buttons on a potentially laggy site.
+# It includes robust error handling, crash recovery, and performance optimizations.
 
 import asyncio
 import os
+import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-from playwright_stealth import Stealth  # Use Stealth class for anti-detection
+from playwright_stealth import Stealth
 
 # --- IMPORTANT: USER CONFIGURATION ---
-# Verify these selectors manually on a logged-in page (e.g., https://remilia.com/~david)
+# These selectors target buttons that are NOT disabled. This is more efficient.
 BUTTON_1_SELECTOR = 'button.btn.friend.inverted:not(.disabled)'  # Targets the "Add Friend" button
-BUTTON_2_SELECTOR = 'button.btn.poke.inverted:not(.disabled)'   # Targets the "Poke" button
-# Note: If "Poke" button has 'bin' instead of 'btn', change to 'button.bin.poke.inverted:not(.disabled)'
-DYNAMIC_WAIT_SELECTOR = 'body, .profile-header'                 # Adjust to a visible element (e.g., .profile-header or .user-actions)
+BUTTON_2_SELECTOR = 'button.btn.poke.inverted:not(.disabled)'    # Targets the "Poke" button
+LOGIN_URL = 'https://remilia.com/'
 
-# The base URL of the site you need to log into.
-LOGIN_URL = 'https://remilia.com/' 
+# This selector should point to an element that reliably appears when the main
+# content of the profile page has loaded. A profile header or container is a good choice.
+DYNAMIC_WAIT_SELECTOR = '.profile-header'
+FALLBACK_SELECTOR = 'body'  # Fallback if profile-header isn't reliable
 
 # --- SCRIPT SETTINGS ---
 INPUT_FILE = 'output_urls.txt'
-AUTH_FILE = 'playwright_auth_state.json' # File to store the secure login session
-MAX_CONCURRENT_PAGES = 15  # Set to 15; reduce to 10 if system lags
-PAGE_LOAD_TIMEOUT = 60000  # 60s
-BUTTON_CLICK_TIMEOUT = 30000  # 30s
-DYNAMIC_WAIT_TIMEOUT = 120000  # Increased to 120s (2 minutes) for dynamic content
+AUTH_FILE = 'playwright_auth_state.json'    # Stores the secure login session
+PROCESSED_FILE = 'processed_urls.txt'       # Tracks already completed URLs to allow resuming
+MAX_CONCURRENT_PAGES = 3      # Reduced to 3 to prevent overwhelming the site/system
+PAGE_LOAD_TIMEOUT = 30000     # 30 seconds to wait for the page structure to load
+ACTION_TIMEOUT = 20000        # 20 seconds for individual actions like clicking
+MAX_RETRIES = 2               # Number of times to retry a failed URL
 
-async def click_buttons_on_page(semaphore, context, url):
-    """Navigates to a URL within a logged-in context, attempts to click buttons, and handles errors."""
-    async with semaphore:
-        page = None
+async def click_buttons_on_page(context, url):
+    """
+    Navigates to a URL, clicks buttons with retries, and reports status.
+    This function is optimized for speed and reliability.
+    """
+    page = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
             page = await context.new_page()
-            # No per-page stealth needed; applied to context
-            print(f"[START]  Processing {url}")
-            await page.goto(url, wait_until='load', timeout=PAGE_LOAD_TIMEOUT)
 
-            # Wait for dynamic content to fully render
-            await page.wait_for_load_state('domcontentloaded', timeout=PAGE_LOAD_TIMEOUT)
-            await page.wait_for_load_state('networkidle', timeout=DYNAMIC_WAIT_TIMEOUT)  # Wait for network to settle
-            await page.wait_for_selector(DYNAMIC_WAIT_SELECTOR, timeout=DYNAMIC_WAIT_TIMEOUT, state='attached')
-            print(f"[READY]  Page content loaded for {url}")
+            # --- OPTIMIZATION: Block non-essential resources ---
+            # This dramatically speeds up page loads by not downloading images, stylesheets, etc.
+            await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff2}", lambda route: route.abort())
 
-            # Check and attempt to click Button 1
-            print(f"[CHECK 1] Checking for button 1 on {url}")
-            button1_exists = await page.query_selector(BUTTON_1_SELECTOR) is not None
-            print(f"[CHECK 1] Button 1 found: {button1_exists}")
-            if button1_exists:
-                print(f"[WAIT 1] Waiting for button 1 on {url}")
-                await page.wait_for_selector(BUTTON_1_SELECTOR, timeout=BUTTON_CLICK_TIMEOUT)
-                print(f"[CLICK 1] Attempting to click button 1 on {url}")
-                try:
-                    await page.click(BUTTON_1_SELECTOR, timeout=BUTTON_CLICK_TIMEOUT)
-                    print(f"[OK 1]   Successfully clicked button 1 on {url}")
-                except Exception as click_err:
-                    print(f"[FAIL 1] Failed to click button 1 on {url}: {click_err}")
-            else:
-                print(f"[SKIP 1] Button 1 not found on {url}")
+            # Navigate to the URL. 'domcontentloaded' is faster than 'load'.
+            print(f"[ATTEMPT {attempt+1}/{MAX_RETRIES+1}] Navigating to {url}")
+            await page.goto(url, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT)
 
-            # Check and attempt to click Button 2
-            print(f"[CHECK 2] Checking for button 2 on {url}")
-            button2_exists = await page.query_selector(BUTTON_2_SELECTOR) is not None
-            print(f"[CHECK 2] Button 2 found: {button2_exists}")
-            if button2_exists:
-                print(f"[WAIT 2] Waiting for button 2 on {url}")
-                await page.wait_for_selector(BUTTON_2_SELECTOR, timeout=BUTTON_CLICK_TIMEOUT)
-                print(f"[CLICK 2] Attempting to click button 2 on {url}")
-                try:
-                    await page.click(BUTTON_2_SELECTOR, timeout=BUTTON_CLICK_TIMEOUT)
-                    print(f"[OK 2]   Successfully clicked button 2 on {url}")
-                except Exception as click_err:
-                    print(f"[FAIL 2] Failed to click button 2 on {url}: {click_err}")
-            else:
-                print(f"[SKIP 2] Button 2 not found on {url}")
+            # --- OPTIMIZATION: Wait for a key element with fallback ---
+            # Try profile-header first, fall back to body if needed
+            try:
+                await page.wait_for_selector(DYNAMIC_WAIT_SELECTOR, state='visible', timeout=ACTION_TIMEOUT)
+                print(f"[DEBUG] Found {DYNAMIC_WAIT_SELECTOR} on {url}")
+            except PlaywrightTimeoutError:
+                print(f"[DEBUG] {DYNAMIC_WAIT_SELECTOR} not found, trying {FALLBACK_SELECTOR} on {url}")
+                await page.wait_for_selector(FALLBACK_SELECTOR, state='visible', timeout=ACTION_TIMEOUT)
+                print(f"[DEBUG] Found {FALLBACK_SELECTOR} on {url}")
 
-            return (url, "Success" if "[OK 2]" in [x for x in locals().values() if isinstance(x, str)] else "Partial/Failed" if "[OK 1]" in [x for x in locals().values() if isinstance(x, str)] else "Failed")
+            status_b1 = "Not Found"
+            status_b2 = "Not Found"
 
-        except PlaywrightTimeoutError:
-            error_message = f"Timeout Error: Could not find elements or page took too long to load on {url}"
-            print(f"[ERROR]  {error_message}")
-            if page:
-                content = await page.content()  # Log page content for debugging
-                print(f"[DEBUG CONTENT] {content[:500]}...")
-            return (url, error_message)
+            # --- Click Button 1 (Add Friend) ---
+            try:
+                # The selector already filters for enabled buttons. We just try to click.
+                await page.click(BUTTON_1_SELECTOR, timeout=ACTION_TIMEOUT)
+                status_b1 = "Clicked"
+                print(f"[OK 1]   Clicked 'Add Friend' on {url}")
+            except PlaywrightTimeoutError:
+                # This happens if the button doesn't exist or is disabled (already friends).
+                status_b1 = "Skipped (Not found/disabled)"
+                print(f"[SKIP 1] 'Add Friend' button not available on {url}")
+
+            # --- Click Button 2 (Poke) ---
+            try:
+                await page.click(BUTTON_2_SELECTOR, timeout=ACTION_TIMEOUT)
+                status_b2 = "Clicked"
+                print(f"[OK 2]   Clicked 'Poke' on {url}")
+            except PlaywrightTimeoutError:
+                status_b2 = "Skipped (Not found/disabled)"
+                print(f"[SKIP 2] 'Poke' button not available on {url}")
+
+            # If we reach here, the process for this URL was successful.
+            await page.close()
+            return (url, f"Success: Friend={status_b1}, Poke={status_b2}")
+
         except Exception as e:
-            error_message = f"An unexpected error occurred on {url}: {e}"
-            print(f"[ERROR]  {error_message}")
-            return (url, str(e))
-        finally:
+            error_message = str(e).split('\n')[0]  # Get a concise error message
+            print(f"[ERROR]  Attempt {attempt+1} on {url} failed: {error_message}")
             if page:
                 await page.close()
-
+            if attempt < MAX_RETRIES:
+                delay = 5 * (attempt + 1)  # Wait longer between retries
+                print(f"[RETRY]  Waiting {delay}s before retrying {url}...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"[FAIL]   URL {url} failed after all retries.")
+                return (url, f"Failed: {error_message}")
 
 async def main():
-    """Reads URLs and processes them in parallel after ensuring the user is logged in."""
+    """Main function to set up Playwright, handle logins, and run the tasks."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_path = os.path.join(script_dir, INPUT_FILE)
     auth_path = os.path.join(script_dir, AUTH_FILE)
+    processed_path = os.path.join(script_dir, PROCESSED_FILE)
+
+    # --- Resume Logic ---
+    processed_urls = set()
+    if os.path.exists(processed_path):
+        with open(processed_path, 'r', encoding='utf-8') as f:
+            processed_urls = set(line.strip() for line in f)
 
     if not os.path.exists(input_path):
         print(f"Error: Input file '{input_path}' not found.")
         return
 
-    async with async_playwright() as p:
-        browser = None
-        context = None
+    with open(input_path, 'r', encoding='utf-8') as f:
+        urls_to_process = [line.strip() for line in f if line.strip() and line.strip() not in processed_urls]
 
+    if not urls_to_process:
+        print("All URLs have already been processed. Nothing to do.")
+        return
+
+    print(f"Found {len(urls_to_process)} new URLs to process.")
+
+    async with async_playwright() as p:
+        # --- Secure Login Handling ---
         if not os.path.exists(auth_path):
-            # --- ONE-TIME LOGIN PROCESS ---
-            print("\n--- Login Required ---")
-            print("Authentication file not found. A browser window will open.")
-            print(f"Please log in to {LOGIN_URL} manually.")
-            print("After you have successfully logged in, CLOSE THE BROWSER WINDOW to continue.")
-            
-            browser = await p.chromium.launch(headless=False)  # Non-headless for interactive login
+            print("\n--- One-Time Login Required ---")
+            print(f"A browser window will open. Please log in to {LOGIN_URL}.")
+            print("After you successfully log in, CLOSE THE BROWSER WINDOW to continue.")
+            browser = await p.chromium.launch(headless=False)
             context = await browser.new_context()
             page = await context.new_page()
             await page.goto(LOGIN_URL)
-            
-            # Wait for manual close after login
-            input("Press Enter after closing the browser window...")  # Better than wait_for_event for reliability
-            
-            # Save the authentication state to the file.
+            await page.wait_for_event('close', timeout=0)  # Wait until user closes the window
             await context.storage_state(path=auth_path)
             print("Authentication state saved successfully!")
             await browser.close()
-            browser = None  # Reset for next launch
-        
-        # --- RUN THE MAIN TASK ---
-        with open(input_path, 'r', encoding='utf-8') as f:
-            urls = [line.strip() for line in f if line.strip()]
 
-        if not urls:
-            print("Input file is empty. Nothing to process.")
-            return
-            
-        print(f"\nFound {len(urls)} URLs. Starting processing...")
-        
-        # Launch a new browser with the saved authentication state
-        browser = await p.chromium.launch(headless=True)
+        # --- Main Processing Loop ---
+        browser = await p.chromium.launch(headless=True)  # Run headless for speed
         context = await browser.new_context(storage_state=auth_path)
         
-        # Apply stealth to the context (once, for all pages)
-        stealth = Stealth()
-        await stealth.apply_stealth_async(context)
-        print("[STEALTH] Applied stealth evasions to browser context.")
+        # --- Applying stealth using the class-based approach ---
+        await Stealth().apply_stealth_async(context)
+        print("Browser context configured with stealth settings.")
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+        results = []
         
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)  # Limit concurrency
-        tasks = [click_buttons_on_page(semaphore, context, url) for url in urls]
-        try:
-            results = await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            print("[INFO] Script interrupted by user. Closing gracefully...")
-            await browser.close()
-            return
-        
+        async def run_task(url):
+            async with semaphore:
+                result = await click_buttons_on_page(context, url)
+                results.append(result)
+                # Save progress immediately after a URL is processed
+                with open(processed_path, 'a', encoding='utf-8') as f:
+                    f.write(url + '\n')
+
+        tasks = [run_task(url) for url in urls_to_process]
+        await asyncio.gather(*tasks)
+
         await browser.close()
 
+        # --- Final Summary ---
         print("\n--- Processing Complete ---")
-        success_count = 0
-        for url, status in results:
-            if status == "Success":
-                success_count += 1
-            print(f"- {url}: {status}")
-        print(f"\nSummary: {success_count} / {len(urls)} URLs processed successfully.")
-
+        success_count = sum(1 for _, status in results if status and status.startswith("Success"))
+        print(f"Summary: {success_count} / {len(urls_to_process)} URLs processed successfully in this run.")
+        print(f"See {PROCESSED_FILE} for a complete list of all attempted URLs.")
 
 if __name__ == "__main__":
-    print("--- Secure Web Page Button Clicker ---")
+    print("--- Optimized & Secure Button Clicker ---")
+    print("If this is your first time, you may need to install stealth:")
+    print("pip install playwright-stealth\n")
     asyncio.run(main())
